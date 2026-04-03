@@ -1,7 +1,10 @@
 // xhs-login-helper/index.ts
-// One-time XHS login helper — deploy on Render (free tier, Docker).
+// One-time XHS login helper — deploy on Render (free tier).
 // Visit in your iPad browser to scan the QR code.
 // Cookies are saved to Supabase automatically after login.
+//
+// IMPORTANT: Uses chromium.executablePath() so Playwright uses the exact
+// browser installed during the Render build step — avoids version mismatch errors.
 
 import express from "express";
 import { chromium } from "playwright";
@@ -58,9 +61,21 @@ app.get("/login", async (req, res) => {
   (async () => {
     let browser: import("playwright").Browser | undefined;
     try {
+      // executablePath() points to the browser installed by `npx playwright install chromium`
+      // during the Render build — this prevents the "Executable doesn't exist" version mismatch error
+      const execPath = chromium.executablePath();
+      console.log("Using Chromium at:", execPath);
+
       browser = await chromium.launch({
+        executablePath: execPath,
         headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--lang=zh-CN"],
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-blink-features=AutomationControlled",
+          "--lang=zh-CN",
+        ],
       });
 
       const context = await browser.newContext({
@@ -72,10 +87,9 @@ app.get("/login", async (req, res) => {
 
       const page = await context.newPage();
 
-      // Pass script as a string to avoid TypeScript complaining about browser globals (navigator, window)
       await page.addInitScript(`
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };;
+        window.chrome = { runtime: {} };
       `);
 
       await page.goto("https://www.xiaohongshu.com", { waitUntil: "networkidle", timeout: 30000 });
@@ -83,7 +97,14 @@ app.get("/login", async (req, res) => {
       if (loginBtn) await loginBtn.click();
       await page.waitForTimeout(2500);
 
-      const qrSelectors = ['[class*="qrcode"] canvas','[class*="qr-code"] canvas','canvas[class*="qr"]','[class*="loginQrcode"]','.qrcode-img','img[src*="qrcode"]'];
+      const qrSelectors = [
+        '[class*="qrcode"] canvas',
+        '[class*="qr-code"] canvas',
+        'canvas[class*="qr"]',
+        '[class*="loginQrcode"]',
+        '.qrcode-img',
+        'img[src*="qrcode"]',
+      ];
 
       const getQRBuffer = async (): Promise<Buffer | null> => {
         for (const sel of qrSelectors) {
@@ -95,22 +116,38 @@ app.get("/login", async (req, res) => {
 
       const qrBuffer = await getQRBuffer();
       if (qrBuffer) {
-        sessions.set(phone, { qrDataUrl: `data:image/png;base64,${qrBuffer.toString("base64")}`, status: "waiting_scan" });
+        sessions.set(phone, {
+          qrDataUrl: `data:image/png;base64,${qrBuffer.toString("base64")}`,
+          status: "waiting_scan",
+        });
       }
 
       const deadline = Date.now() + 120_000;
       while (Date.now() < deadline) {
         await page.waitForTimeout(2000);
+
         const refreshBuffer = await getQRBuffer();
         const currentState = sessions.get(phone);
         if (refreshBuffer && currentState?.status === "waiting_scan") {
-          sessions.set(phone, { ...currentState, qrDataUrl: `data:image/png;base64,${refreshBuffer.toString("base64")}` });
+          sessions.set(phone, {
+            ...currentState,
+            qrDataUrl: `data:image/png;base64,${refreshBuffer.toString("base64")}`,
+          });
         }
-        const loggedIn = await page.$('[data-testid="user-avatar"], .user-avatar, [class*="userAvatar"], .reds-avatar');
+
+        const loggedIn = await page.$(
+          '[data-testid="user-avatar"], .user-avatar, [class*="userAvatar"], .reds-avatar'
+        );
         if (loggedIn) {
           const cookies = await context.cookies();
-          const { error } = await supabase.from("xhs_accounts").upsert({ phone, cookie_json: JSON.stringify(cookies), active: true }, { onConflict: "phone" });
-          sessions.set(phone, { qrDataUrl: null, status: error ? "error" : "success", error: error?.message });
+          const { error } = await supabase
+            .from("xhs_accounts")
+            .upsert({ phone, cookie_json: JSON.stringify(cookies), active: true }, { onConflict: "phone" });
+          sessions.set(phone, {
+            qrDataUrl: null,
+            status: error ? "error" : "success",
+            error: error?.message,
+          });
           console.log(error ? `Error saving cookies for ${phone}: ${error.message}` : `Saved cookies for ${phone}`);
           break;
         }
@@ -152,7 +189,13 @@ app.get("/login", async (req, res) => {
               var statusEl = document.getElementById('status');
               var qrEl = document.getElementById('qr');
               if (data.qrDataUrl) { qrEl.src = data.qrDataUrl; qrEl.style.display = 'block'; }
-              var msgs = { starting:'Starting browser...', waiting_scan:'Open XHS app and scan the QR code above', success:'Login successful! Cookies saved.', timeout:'Timed out. Refresh and try again.', error:'Error: '+(data.error||'Unknown') };
+              var msgs = {
+                starting: 'Starting browser...',
+                waiting_scan: 'Open XHS app and scan the QR code above',
+                success: 'Login successful! Cookies saved.',
+                timeout: 'Timed out. Refresh and try again.',
+                error: 'Error: ' + (data.error || 'unknown'),
+              };
               statusEl.textContent = msgs[data.status] || data.status;
               if (data.status === 'success') { statusEl.className='status success'; qrEl.style.display='none'; }
               else if (data.status === 'timeout' || data.status === 'error') { statusEl.className='status error'; }
@@ -184,18 +227,33 @@ app.get("/accounts", async function(req, res) {
   const token = (req.query.token as string) || "";
   const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
 
-  const { data, error } = await supabase.from("xhs_accounts").select("phone, active, banned, shadowbanned, last_post_at, posts_today, cookie_json");
+  const { data, error } = await supabase
+    .from("xhs_accounts")
+    .select("phone, active, banned, shadowbanned, last_post_at, posts_today, cookie_json");
   if (error) return res.status(500).send(`<h2>Supabase error: ${error.message}</h2>`);
 
   const rows = (data || []).map(function(a: Record<string, unknown>) {
-    const sessionStatus = a.cookie_json ? '<span style="color:green">Active</span>' : '<span style="color:orange">Needs login</span>';
+    const sessionStatus = a.cookie_json
+      ? '<span style="color:green">Active</span>'
+      : '<span style="color:orange">Needs login</span>';
     const loginUrl = `/login?phone=${encodeURIComponent(String(a.phone))}${token ? "&token=" + encodeURIComponent(token) : ""}`;
-    return `<tr><td>${a.phone}</td><td>${a.active ? "Yes" : "No"}</td><td>${a.banned ? "Banned" : "OK"}</td><td>${a.shadowbanned ? "Shadowbanned" : "OK"}</td><td>${a.last_post_at ? new Date(String(a.last_post_at)).toLocaleString() : "Never"}</td><td>${a.posts_today}</td><td>${sessionStatus}</td><td><a href="${loginUrl}">Login</a></td></tr>`;
+    const lastPost = a.last_post_at ? new Date(String(a.last_post_at)).toLocaleString() : "Never";
+    return `<tr>
+      <td>${a.phone}</td><td>${a.active ? "Yes" : "No"}</td><td>${a.banned ? "Banned" : "OK"}</td>
+      <td>${a.shadowbanned ? "Shadowbanned" : "OK"}</td><td>${lastPost}</td>
+      <td>${a.posts_today}</td><td>${sessionStatus}</td>
+      <td><a href="${loginUrl}">Login / Refresh</a></td>
+    </tr>`;
   }).join("");
 
   res.send(`<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>body{font-family:sans-serif;padding:20px;background:#f9f9f9}h2{color:#e94560}table{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)}th{background:#1a1a2e;color:white;padding:12px 8px;text-align:left;font-size:13px}td{padding:12px 8px;border-bottom:1px solid #eee;font-size:14px}a{color:#6c63ff}.add-btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:8px;font-size:16px}</style>
-    </head><body>
+    <style>
+      body{font-family:sans-serif;padding:20px;background:#f9f9f9}h2{color:#e94560}
+      table{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)}
+      th{background:#1a1a2e;color:white;padding:10px 8px;text-align:left;font-size:13px}
+      td{padding:10px 8px;border-bottom:1px solid #eee;font-size:14px}a{color:#6c63ff}
+      .add-btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:8px;font-size:16px}
+    </style></head><body>
       <h2>XHS Accounts</h2>
       <table><tr><th>Phone</th><th>Active</th><th>Banned</th><th>Shadowbanned</th><th>Last Post</th><th>Posts Today</th><th>Session</th><th>Action</th></tr>
       ${rows || '<tr><td colspan="8" style="text-align:center;color:#999">No accounts yet</td></tr>'}
@@ -205,8 +263,13 @@ app.get("/accounts", async function(req, res) {
 });
 
 app.get("/", function(_req, res) {
-  res.send(`<html><body style="font-family:sans-serif;padding:32px;text-align:center"><h2>XHS Login Helper is running</h2><p><a href="/accounts">View Accounts</a></p></body></html>`);
+  res.send(`<html><body style="font-family:sans-serif;padding:32px;text-align:center">
+    <h2>XHS Login Helper is running</h2><p><a href="/accounts">View Accounts</a></p>
+  </body></html>`);
 });
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
-app.listen(PORT, "0.0.0.0", function() { console.log("XHS login helper running on port " + PORT); });
+app.listen(PORT, "0.0.0.0", function() {
+  console.log("XHS login helper running on port " + PORT);
+  console.log("Chromium path:", chromium.executablePath());
+});
