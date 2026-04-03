@@ -1,26 +1,27 @@
-// xhs-poster/index.ts
-// Uses Playwright to automate 小红书 posting
-// IMPORTANT: Run on a Chinese IP or VPN for best results
+// supabase/functions/xhs-poster/index.ts
+// Runs as a Supabase Edge Function — no Playwright, no VPS needed.
+// Uses XHS internal web API with session cookies saved in DB.
 //
-// Setup:
-// npm install playwright @supabase/supabase-js sharp canvas
-// npx playwright install chromium
-// npx ts-node index.ts
+// Deploy via Supabase Dashboard → Edge Functions → New Function → paste this file
+// OR: supabase functions deploy xhs-poster
+//
+// Schedule: Supabase Dashboard → Edge Functions → xhs-poster → Schedules
+// Cron: 0 4,16 * * *  (runs at 4am and 4pm UTC)
+//
+// Prerequisites:
+//   - Supabase Storage bucket named "post-images" set to Public
+//   - xhs_accounts table populated and cookies saved via xhs-login-helper on Render
 
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
-import { createClient } from "@supabase/supabase-js";
-import * as fs from "fs";
-import * as path from "path";
-import { createCanvas } from "canvas";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
 );
 
 // ── Image Generation ──────────────────────────────────────────
-// Generates simple but clean carousel images from slide text
-// No external image API needed — pure canvas
+// Generates carousel slides as SVG, uploads to Supabase Storage.
+// No native canvas bindings — pure SVG converted to PNG via resvg-js WASM.
 
 interface Slide {
   slide: number;
@@ -28,381 +29,238 @@ interface Slide {
   heading: string;
   subtext?: string;
   body?: string;
-  image_prompt?: string;
 }
 
 const THEMES = [
   { bg: "#1a1a2e", accent: "#e94560", text: "#ffffff", sub: "#a8a8b3" },
   { bg: "#0f3460", accent: "#e94560", text: "#ffffff", sub: "#a8d8ea" },
-  { bg: "#16213e", accent: "#0f3460", text: "#ffffff", sub: "#a8a8b3" },
   { bg: "#f5f0e8", accent: "#d4a853", text: "#2c2c2c", sub: "#666666" },
   { bg: "#f8f9fa", accent: "#6c63ff", text: "#2c2c2c", sub: "#666666" },
 ];
 
-function wrapText(ctx: ReturnType<typeof createCanvas>['getContext'], text: string, maxWidth: number): string[] {
-  const words = text.split("");
+function wrapTextSVG(text: string, maxCharsPerLine = 18): string[] {
   const lines: string[] = [];
-  let currentLine = "";
-
-  for (const char of words) {
-    const testLine = currentLine + char;
-    const metrics = (ctx as CanvasRenderingContext2D).measureText(testLine);
-    if (metrics.width > maxWidth && currentLine !== "") {
-      lines.push(currentLine);
-      currentLine = char;
-    } else {
-      currentLine = testLine;
-    }
+  for (let i = 0; i < text.length; i += maxCharsPerLine) {
+    lines.push(text.slice(i, i + maxCharsPerLine));
   }
-  if (currentLine) lines.push(currentLine);
   return lines;
 }
 
-async function generateSlideImage(slide: Slide, themeIndex: number): Promise<Buffer> {
-  const WIDTH = 1080;
-  const HEIGHT = 1350; // XHS standard 4:5 ratio
-  const canvas = createCanvas(WIDTH, HEIGHT);
-  const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
+function generateSlideSVG(slide: Slide, themeIndex: number): string {
   const theme = THEMES[themeIndex % THEMES.length];
+  const W = 1080;
+  const H = 1350;
+  const headingLines = wrapTextSVG(slide.heading, 16);
+  const headingFontSize = slide.type === "cover" ? 72 : 58;
+  const headingY = slide.type === "cover" ? 520 : 280;
 
-  // Background
-  ctx.fillStyle = theme.bg;
-  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  const headingElems = headingLines
+    .map((line, i) =>
+      `<text x="80" y="${headingY + i * headingFontSize * 1.3}" font-size="${headingFontSize}" font-weight="bold" fill="${theme.text}" font-family="sans-serif">${line}</text>`
+    ).join("\n");
 
-  // Decorative element (top-right corner accent)
-  ctx.fillStyle = theme.accent;
-  ctx.beginPath();
-  ctx.arc(WIDTH + 100, -100, 380, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.globalAlpha = 0.15;
-  ctx.fillStyle = theme.accent;
-  ctx.beginPath();
-  ctx.arc(WIDTH + 50, -50, 250, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.globalAlpha = 1;
+  const subtextElem = slide.type === "cover" && slide.subtext
+    ? `<text x="80" y="${headingY + headingLines.length * headingFontSize * 1.3 + 60}" font-size="36" fill="${theme.sub}" font-family="sans-serif">${slide.subtext}</text>`
+    : "";
 
-  // Slide number indicator
-  ctx.fillStyle = theme.accent;
-  ctx.font = "bold 28px sans-serif";
-  ctx.fillText(`${slide.slide} / 5`, 80, 100);
+  const bodyLines = slide.body ? wrapTextSVG(slide.body, 20) : [];
+  const bodyY = headingY + headingLines.length * headingFontSize * 1.3 + 80;
+  const bodyElems = bodyLines
+    .map((line, i) =>
+      `<text x="80" y="${bodyY + i * 58}" font-size="38" fill="${theme.sub}" font-family="sans-serif">${line}</text>`
+    ).join("\n");
 
-  // Heading
-  ctx.fillStyle = theme.text;
-  const headingSize = slide.type === "cover" ? 72 : 58;
-  ctx.font = `bold ${headingSize}px sans-serif`;
-  const headingLines = wrapText(ctx as any, slide.heading, WIDTH - 160);
-  headingLines.forEach((line, i) => {
-    const y = slide.type === "cover" ? 520 + i * (headingSize * 1.3) : 280 + i * (headingSize * 1.3);
-    ctx.fillText(line, 80, y);
-  });
-
-  // Subtext (cover only)
-  if (slide.type === "cover" && slide.subtext) {
-    const subY = 520 + headingLines.length * (headingSize * 1.3) + 40;
-    ctx.fillStyle = theme.sub;
-    ctx.font = "36px sans-serif";
-    const subLines = wrapText(ctx as any, slide.subtext, WIDTH - 160);
-    subLines.forEach((line, i) => {
-      ctx.fillText(line, 80, subY + i * 50);
-    });
-  }
-
-  // Body text (content/cta slides)
-  if (slide.body && slide.type !== "cover") {
-    const bodyY = 280 + headingLines.length * (headingSize * 1.3) + 80;
-    ctx.fillStyle = theme.sub;
-    ctx.font = "38px sans-serif";
-    const bodyLines = wrapText(ctx as any, slide.body, WIDTH - 160);
-    bodyLines.forEach((line, i) => {
-      ctx.fillText(line, 80, bodyY + i * 58);
-    });
-  }
-
-  // Bottom accent bar
-  ctx.fillStyle = theme.accent;
-  ctx.fillRect(0, HEIGHT - 8, WIDTH, 8);
-
-  // Bottom branding text
-  ctx.fillStyle = theme.sub;
-  ctx.font = "26px sans-serif";
-  ctx.fillText("理财学习笔记", 80, HEIGHT - 40);
-
-  return canvas.toBuffer("image/jpeg", { quality: 0.92 });
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">
+    <rect width="${W}" height="${H}" fill="${theme.bg}"/>
+    <circle cx="${W + 100}" cy="-100" r="380" fill="${theme.accent}"/>
+    <circle cx="${W + 50}" cy="-50" r="250" fill="${theme.accent}" opacity="0.15"/>
+    <text x="80" y="100" font-size="28" font-weight="bold" fill="${theme.accent}" font-family="sans-serif">${slide.slide} / 5</text>
+    ${headingElems}
+    ${subtextElem}
+    ${bodyElems}
+    <rect x="0" y="${H - 8}" width="${W}" height="8" fill="${theme.accent}"/>
+    <text x="80" y="${H - 40}" font-size="26" fill="${theme.sub}" font-family="sans-serif">理财学习笔记</text>
+  </svg>`;
 }
 
-async function generateCarouselImages(slides: Slide[], postId: string): Promise<string[]> {
+async function svgToPng(svg: string): Promise<Uint8Array> {
+  const { Resvg } = await import("npm:@resvg/resvg-js@2");
+  const resvg = new Resvg(svg, { fitTo: { mode: "width", value: 1080 } });
+  return resvg.render().asPng();
+}
+
+async function generateAndUploadCarousel(slides: Slide[], postId: string): Promise<string[]> {
   const themeIndex = Math.floor(Math.random() * THEMES.length);
-  const imagePaths: string[] = [];
-  const tmpDir = `/tmp/xhs_${postId}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const uploadedUrls: string[] = [];
 
   for (const slide of slides) {
-    const buffer = await generateSlideImage(slide, themeIndex);
-    const imagePath = path.join(tmpDir, `slide_${slide.slide}.jpg`);
-    fs.writeFileSync(imagePath, buffer);
-    imagePaths.push(imagePath);
+    const png = await svgToPng(generateSlideSVG(slide, themeIndex));
+    const filePath = `xhs/${postId}/slide_${slide.slide}.png`;
+
+    const { error } = await supabase.storage
+      .from("post-images")
+      .upload(filePath, png, { contentType: "image/png", upsert: true });
+
+    if (error) throw new Error(`Storage upload failed: ${error.message}`);
+
+    const { data: urlData } = supabase.storage.from("post-images").getPublicUrl(filePath);
+    uploadedUrls.push(urlData.publicUrl);
   }
 
-  return imagePaths;
+  return uploadedUrls;
 }
 
-// ── XHS Session Management ────────────────────────────────────
+// ── XHS API Client ─────────────────────────────────────────────
+// Calls XHS creator web API directly using session cookies.
+// Cookies are obtained via xhs-login-helper (Render) and stored in xhs_accounts.
 
-async function loadXHSSession(context: BrowserContext, cookieJson: string) {
-  const cookies = JSON.parse(cookieJson);
-  await context.addCookies(cookies);
+interface XHSCookie { name: string; value: string; domain: string; }
+
+function cookiesToHeader(cookieJson: string): string {
+  const cookies: XHSCookie[] = JSON.parse(cookieJson);
+  return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
 }
 
-async function saveXHSSession(context: BrowserContext, accountPhone: string) {
-  const cookies = await context.cookies();
-  await supabase
-    .from("xhs_accounts")
-    .update({ cookie_json: JSON.stringify(cookies) })
-    .eq("phone", accountPhone);
+async function uploadImageToXHS(imageUrl: string, cookieHeader: string): Promise<string | null> {
+  const imageResp = await fetch(imageUrl);
+  const imageBlob = await imageResp.blob();
+
+  const tokenResp = await fetch("https://creator.xiaohongshu.com/api/galaxy/upload/token", {
+    headers: {
+      Cookie: cookieHeader,
+      Referer: "https://creator.xiaohongshu.com/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    },
+  });
+  if (!tokenResp.ok) return null;
+  const { data: { token, uploadUrl } } = await tokenResp.json();
+
+  const formData = new FormData();
+  formData.append("file", imageBlob, "slide.png");
+  formData.append("token", token);
+
+  const uploadResp = await fetch(uploadUrl, { method: "POST", body: formData });
+  if (!uploadResp.ok) return null;
+  const uploadData = await uploadResp.json();
+  return uploadData.data?.fileId ?? null;
 }
 
-async function loginXHS(page: Page, phone: string): Promise<boolean> {
-  await page.goto("https://www.xiaohongshu.com", { waitUntil: "networkidle" });
-
-  // Check if already logged in
-  const isLoggedIn = await page.$('[data-testid="user-avatar"]') !== null;
-  if (isLoggedIn) return true;
-
-  console.log("Not logged in — attempting login...");
-  // Click login button
-  const loginBtn = await page.$("text=登录");
-  if (!loginBtn) return false;
-  await loginBtn.click();
-
-  // Wait for QR code or phone login modal
-  // Note: XHS often requires manual QR scan — we handle this by using saved cookies
-  console.warn("⚠️ Manual login required. Please scan QR code within 60 seconds.");
-  try {
-    await page.waitForSelector('[data-testid="user-avatar"]', { timeout: 60000 });
-    console.log("✅ Login successful");
-    return true;
-  } catch {
-    console.error("Login timeout");
-    return false;
-  }
-}
-
-// ── XHS Post Submission ───────────────────────────────────────
-
-async function postToXHS(
-  page: Page,
-  post: {
-    id: string;
-    title: string;
-    body: string;
-    hashtags: string[];
-    carousel_slides: Slide[];
-    xhs_topic_tags: string[];
-  }
+async function publishXHSPost(
+  post: { id: string; title: string; body: string; hashtags: string[]; carousel_slides: Slide[]; xhs_topic_tags: string[] },
+  cookieHeader: string
 ): Promise<{ success: boolean; url?: string; error?: string }> {
   try {
-    // Navigate to creator center
-    await page.goto("https://creator.xiaohongshu.com/publish/publish", {
-      waitUntil: "networkidle",
-      timeout: 30000,
+    const imageUrls = await generateAndUploadCarousel(post.carousel_slides, post.id);
+    const fileIds: string[] = [];
+
+    for (const url of imageUrls) {
+      const fileId = await uploadImageToXHS(url, cookieHeader);
+      if (!fileId) throw new Error("Image upload to XHS CDN failed");
+      fileIds.push(fileId);
+    }
+
+    const hashtagStr = post.hashtags.slice(0, 5).map((t) => `#${t}`).join(" ");
+    const description = `${post.body}\n\n${hashtagStr}`;
+
+    const publishResp = await fetch("https://creator.xiaohongshu.com/api/sns/v1/note/create", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Cookie: cookieHeader,
+        Referer: "https://creator.xiaohongshu.com/publish/publish",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "X-B3-TraceId": crypto.randomUUID().replace(/-/g, "").slice(0, 16),
+      },
+      body: JSON.stringify({
+        common: {
+          type: 1,
+          title: post.title,
+          note_id: "",
+          ats: [],
+          hash_tag: post.xhs_topic_tags.slice(0, 3).map((name) => ({ name })),
+        },
+        image_info: { images: fileIds.map((id, idx) => ({ file_id: id, index: idx })) },
+        post_info: { desc: description, privacy_info: { op_type: 0 } },
+      }),
     });
 
-    // Wait for upload button
-    await page.waitForSelector('input[type="file"]', { timeout: 15000 });
-
-    // Generate carousel images
-    console.log("Generating carousel images...");
-    const imagePaths = await generateCarouselImages(post.carousel_slides, post.id);
-    console.log(`Generated ${imagePaths.length} slide images`);
-
-    // Upload images
-    const fileInput = page.locator('input[type="file"]').first();
-    await fileInput.setInputFiles(imagePaths);
-
-    // Wait for images to upload
-    await page.waitForTimeout(3000 + Math.random() * 2000);
-
-    // Fill title
-    const titleInput = page.locator('input[placeholder*="标题"], input[placeholder*="title"]').first();
-    if (await titleInput.isVisible()) {
-      await titleInput.click();
-      await titleInput.fill(post.title);
+    if (!publishResp.ok) {
+      const err = await publishResp.text();
+      return { success: false, error: `XHS API error ${publishResp.status}: ${err}` };
     }
 
-    // Fill body/description
-    const bodyInput = page.locator(
-      'textarea[placeholder*="描述"], div[contenteditable="true"][class*="ql-editor"], .editor-container'
-    ).first();
-    await bodyInput.click();
-    await bodyInput.fill(post.body);
+    const data = await publishResp.json();
+    if (data.code !== 0) return { success: false, error: `XHS error code ${data.code}: ${data.msg}` };
 
-    // Add hashtags
-    await page.waitForTimeout(500);
-    for (const tag of post.hashtags.slice(0, 5)) {
-      await bodyInput.type(`#${tag} `);
-      await page.waitForTimeout(300);
-    }
-
-    // Add topic tags if available
-    const topicBtn = page.locator('text=添加话题, text=话题').first();
-    if (await topicBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await topicBtn.click();
-      for (const tag of post.xhs_topic_tags.slice(0, 2)) {
-        const tagInput = page.locator('input[placeholder*="搜索话题"]').first();
-        await tagInput.fill(tag);
-        await page.waitForTimeout(1000);
-        const firstResult = page.locator('.topic-item, [class*="topicItem"]').first();
-        if (await firstResult.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await firstResult.click();
-        }
-      }
-    }
-
-    // Human-like delay before submitting
-    await page.waitForTimeout(2000 + Math.random() * 3000);
-
-    // Click publish
-    const publishBtn = page.locator('button:has-text("发布"), button:has-text("Publish")').first();
-    await publishBtn.click();
-
-    // Wait for success
-    await page.waitForURL(/\/publish\/success|\/note\//, { timeout: 15000 });
-    const url = page.url();
-
-    // Clean up temp images
-    imagePaths.forEach((p) => fs.unlinkSync(p));
-
-    return { success: true, url };
+    const noteId = data.data?.note_id;
+    return { success: true, url: noteId ? `https://www.xiaohongshu.com/explore/${noteId}` : undefined };
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { success: false, error: message };
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
-// ── Main ──────────────────────────────────────────────────────
+// ── Main Handler ───────────────────────────────────────────────
 
-async function main() {
-  console.log(`[${new Date().toISOString()}] XHS poster starting...`);
+Deno.serve(async () => {
+  console.log(`[${new Date().toISOString()}] XHS poster Edge Function starting...`);
 
-  // 1. Get ready XHS post
   const { data: posts } = await supabase
-    .from("posts")
-    .select("*")
-    .eq("platform", "xhs")
-    .eq("status", "ready")
-    .order("created_at")
-    .limit(1);
+    .from("posts").select("*").eq("platform", "xhs").eq("status", "ready")
+    .order("created_at").limit(1);
 
-  if (!posts?.length) { console.log("No XHS posts ready"); return; }
+  if (!posts?.length) {
+    return new Response(JSON.stringify({ message: "No XHS posts ready" }), { status: 200 });
+  }
   const post = posts[0];
 
-  // 2. Get available XHS account
   const { data: accounts } = await supabase
-    .from("xhs_accounts")
-    .select("*")
-    .eq("active", true)
-    .eq("banned", false)
-    .eq("shadowbanned", false)
-    .lt("posts_today", 2)
-    .order("last_post_at", { ascending: true, nullsFirst: true })
-    .limit(1);
+    .from("xhs_accounts").select("*")
+    .eq("active", true).eq("banned", false).eq("shadowbanned", false)
+    .lt("posts_today", 2).not("cookie_json", "is", null)
+    .order("last_post_at", { ascending: true, nullsFirst: true }).limit(1);
 
-  if (!accounts?.length) { console.log("No available XHS accounts"); return; }
+  if (!accounts?.length) {
+    return new Response(
+      JSON.stringify({ message: "No XHS accounts with valid sessions. Visit your Render login helper to re-authenticate." }),
+      { status: 200 }
+    );
+  }
   const account = accounts[0];
 
-  // 3. Launch browser
-  const browser: Browser = await chromium.launch({
-    headless: process.env.NODE_ENV === "production",
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
-      "--lang=zh-CN",
-    ],
-  });
+  await supabase.from("posts").update({ status: "publishing" }).eq("id", post.id);
 
-  const context = await browser.newContext({
-    locale: "zh-CN",
-    timezoneId: "Asia/Shanghai",
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    viewport: { width: 1280, height: 800 },
-  });
-
-  // Load saved session if available
-  if (account.cookie_json) {
-    await loadXHSSession(context, account.cookie_json);
-  }
-
-  const page = await context.newPage();
-
-  // Stealth: remove webdriver property
-  await page.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-    (window as any).chrome = { runtime: {} };
-  });
-
-  try {
-    // 4. Login / verify session
-    const loggedIn = await loginXHS(page, account.phone);
-    if (!loggedIn) {
-      console.error("Could not log in to XHS");
-      await browser.close();
-      return;
-    }
-
-    // Save fresh session
-    await saveXHSSession(context, account.phone);
-
-    // 5. Mark post as publishing
-    await supabase.from("posts").update({ status: "publishing" }).eq("id", post.id);
-
-    // 6. Post
-    const result = await postToXHS(page, {
-      id: post.id,
-      title: post.title,
-      body: post.body,
-      hashtags: post.hashtags ?? [],
-      carousel_slides: post.carousel_slides ?? [],
+  const result = await publishXHSPost(
+    {
+      id: post.id, title: post.title, body: post.body,
+      hashtags: post.hashtags ?? [], carousel_slides: post.carousel_slides ?? [],
       xhs_topic_tags: post.xhs_topic_tags ?? [],
-    });
+    },
+    cookiesToHeader(account.cookie_json)
+  );
 
-    if (result.success) {
-      await supabase.from("posts").update({
-        status: "published",
-        platform_url: result.url,
-        published_at: new Date().toISOString(),
-      }).eq("id", post.id);
+  if (result.success) {
+    await supabase.from("posts").update({
+      status: "published", platform_url: result.url,
+      published_at: new Date().toISOString(),
+    }).eq("id", post.id);
 
-      await supabase.from("xhs_accounts").update({
-        last_post_at: new Date().toISOString(),
-        posts_today: account.posts_today + 1,
-      }).eq("id", account.id);
+    await supabase.from("xhs_accounts").update({
+      last_post_at: new Date().toISOString(),
+      posts_today: account.posts_today + 1,
+    }).eq("id", account.id);
 
-      await supabase.from("analytics").insert({
-        post_id: post.id,
-        platform: "xhs",
-      });
+    await supabase.from("analytics").insert({ post_id: post.id, platform: "xhs" });
+    console.log(`Posted to XHS: ${result.url}`);
+    return new Response(JSON.stringify({ success: true, url: result.url }), { status: 200 });
+  } else {
+    const isBanned = result.error?.includes("违规") || result.error?.includes("封禁");
+    await supabase.from("posts").update({
+      status: isBanned ? "banned" : "failed",
+      failure_reason: result.error,
+      retry_count: (post.retry_count ?? 0) + 1,
+    }).eq("id", post.id);
 
-      console.log(`✅ Posted to XHS: ${result.url}`);
-    } else {
-      const isBanned = result.error?.includes("违规") || result.error?.includes("封禁");
-      await supabase.from("posts").update({
-        status: isBanned ? "banned" : "failed",
-        failure_reason: result.error,
-        retry_count: (post.retry_count ?? 0) + 1,
-      }).eq("id", post.id);
-
-      if (isBanned) {
-        await supabase.from("xhs_accounts").update({ banned: true }).eq("id", account.id);
-        console.warn(`⚠️ Account ${account.phone} banned`);
-      } else {
-        console.error(`❌ Post failed: ${result.error}`);
-      }
-    }
-  } finally {
-    await browser.close();
+    if (isBanned) await supabase.from("xhs_accounts").update({ banned: true }).eq("id", account.id);
+    return new Response(JSON.stringify({ success: false, error: result.error }), { status: 200 });
   }
-}
-
-main().catch(console.error);
+});
