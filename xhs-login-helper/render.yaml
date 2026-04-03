@@ -1,0 +1,20 @@
+# Render deployment config — Render auto-detects this file
+# Docs: https://render.com/docs/render-yaml-spec
+services:
+  - type: web
+    name: xhs-login-helper
+    runtime: node
+    region: singapore
+    plan: free
+    rootDir: xhs-login-helper
+    buildCommand: npm install && npx playwright install-deps chromium && npx playwright install chromium
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: LOGIN_SECRET
+        sync: false
