@@ -1,19 +1,7 @@
 // xhs-login-helper/index.ts
-// One-time XHS login helper — deploy on Render (free tier).
+// One-time XHS login helper — deploy on Render (free tier, Docker).
 // Visit in your iPad browser to scan the QR code.
 // Cookies are saved to Supabase automatically after login.
-//
-// Render setup:
-//   1. render.com → New → Web Service → connect GitHub repo
-//   2. Root Directory: xhs-login-helper
-//   3. Build Command: npm install && npx playwright install-deps chromium && npx playwright install chromium
-//   4. Start Command: npm start
-//   5. Region: Singapore
-//   6. Env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, LOGIN_SECRET
-//
-// Usage from iPad Safari:
-//   https://your-app.onrender.com/accounts?token=YOUR_SECRET
-//   https://your-app.onrender.com/login?phone=+86138xxxx&token=YOUR_SECRET
 
 import express from "express";
 import { chromium } from "playwright";
@@ -43,7 +31,6 @@ interface SessionState {
 }
 const sessions = new Map<string, SessionState>();
 
-// ── GET /login?phone=+86138xxxx&token=SECRET ──────────────────
 app.get("/login", async (req, res) => {
   if (!checkAuth(req, res)) return;
 
@@ -53,16 +40,9 @@ app.get("/login", async (req, res) => {
 
   if (!phone) {
     return res.send(`
-      <html>
-      <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-          body { font-family: sans-serif; padding: 32px; background: #f5f5f5; }
-          input, button { font-size: 18px; padding: 10px; margin: 8px 0; width: 100%; box-sizing: border-box; border-radius: 8px; border: 1px solid #ccc; }
-          button { background: #e94560; color: white; border: none; cursor: pointer; }
-        </style>
-      </head>
-      <body>
+      <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>body{font-family:sans-serif;padding:32px;background:#f5f5f5}input,button{font-size:18px;padding:10px;margin:8px 0;width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #ccc}button{background:#e94560;color:white;border:none;cursor:pointer}</style>
+      </head><body>
         <h2>XHS Login Helper</h2>
         <form action="/login" method="get">
           ${token ? `<input type="hidden" name="token" value="${token}" />` : ""}
@@ -70,25 +50,17 @@ app.get("/login", async (req, res) => {
           <input name="phone" placeholder="+86 138 xxxx xxxx" type="tel" />
           <button type="submit">Start Login</button>
         </form>
-      </body></html>
-    `);
+      </body></html>`);
   }
 
   sessions.set(phone, { qrDataUrl: null, status: "starting" });
 
-  // Launch browser in background
   (async () => {
-    let browser;
+    let browser: import("playwright").Browser | undefined;
     try {
       browser = await chromium.launch({
         headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-blink-features=AutomationControlled",
-          "--lang=zh-CN",
-        ],
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled", "--lang=zh-CN"],
       });
 
       const context = await browser.newContext({
@@ -99,25 +71,19 @@ app.get("/login", async (req, res) => {
       });
 
       const page = await context.newPage();
-      await page.addInitScript(() => {
-        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-        (window as any).chrome = { runtime: {} };
-      });
+
+      // Pass script as a string to avoid TypeScript complaining about browser globals (navigator, window)
+      await page.addInitScript(`
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        window.chrome = { runtime: {} };;
+      `);
 
       await page.goto("https://www.xiaohongshu.com", { waitUntil: "networkidle", timeout: 30000 });
-
       const loginBtn = await page.$("text=登录");
       if (loginBtn) await loginBtn.click();
       await page.waitForTimeout(2500);
 
-      const qrSelectors = [
-        '[class*="qrcode"] canvas',
-        '[class*="qr-code"] canvas',
-        'canvas[class*="qr"]',
-        '[class*="loginQrcode"]',
-        '.qrcode-img',
-        'img[src*="qrcode"]',
-      ];
+      const qrSelectors = ['[class*="qrcode"] canvas','[class*="qr-code"] canvas','canvas[class*="qr"]','[class*="loginQrcode"]','.qrcode-img','img[src*="qrcode"]'];
 
       const getQRBuffer = async (): Promise<Buffer | null> => {
         for (const sel of qrSelectors) {
@@ -129,40 +95,22 @@ app.get("/login", async (req, res) => {
 
       const qrBuffer = await getQRBuffer();
       if (qrBuffer) {
-        sessions.set(phone, {
-          qrDataUrl: `data:image/png;base64,${qrBuffer.toString("base64")}`,
-          status: "waiting_scan",
-        });
+        sessions.set(phone, { qrDataUrl: `data:image/png;base64,${qrBuffer.toString("base64")}`, status: "waiting_scan" });
       }
 
-      // Poll for login success (2 min timeout)
       const deadline = Date.now() + 120_000;
       while (Date.now() < deadline) {
         await page.waitForTimeout(2000);
-
-        // Refresh QR screenshot
         const refreshBuffer = await getQRBuffer();
         const currentState = sessions.get(phone);
         if (refreshBuffer && currentState?.status === "waiting_scan") {
-          sessions.set(phone, {
-            ...currentState,
-            qrDataUrl: `data:image/png;base64,${refreshBuffer.toString("base64")}`,
-          });
+          sessions.set(phone, { ...currentState, qrDataUrl: `data:image/png;base64,${refreshBuffer.toString("base64")}` });
         }
-
-        // Check for logged-in indicators
         const loggedIn = await page.$('[data-testid="user-avatar"], .user-avatar, [class*="userAvatar"], .reds-avatar');
         if (loggedIn) {
           const cookies = await context.cookies();
-          const { error } = await supabase
-            .from("xhs_accounts")
-            .upsert({ phone, cookie_json: JSON.stringify(cookies), active: true }, { onConflict: "phone" });
-
-          sessions.set(phone, {
-            qrDataUrl: null,
-            status: error ? "error" : "success",
-            error: error?.message,
-          });
+          const { error } = await supabase.from("xhs_accounts").upsert({ phone, cookie_json: JSON.stringify(cookies), active: true }, { onConflict: "phone" });
+          sessions.set(phone, { qrDataUrl: null, status: error ? "error" : "success", error: error?.message });
           console.log(error ? `Error saving cookies for ${phone}: ${error.message}` : `Saved cookies for ${phone}`);
           break;
         }
@@ -181,130 +129,84 @@ app.get("/login", async (req, res) => {
   })();
 
   res.send(`
-    <html>
-    <head>
+    <html><head>
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <meta http-equiv="Cache-Control" content="no-cache">
       <style>
-        body { font-family: sans-serif; padding: 24px; text-align: center; background: #f9f9f9; color: #333; }
-        h2 { color: #e94560; }
-        #qr { max-width: 260px; width: 100%; border: 3px solid #e94560; border-radius: 16px; margin: 20px auto; display: none; }
-        .status { font-size: 18px; margin: 16px 0; }
-        .success { color: #22c55e; font-weight: bold; font-size: 22px; }
-        .error, .timeout { color: #e94560; }
-        .hint { color: #999; font-size: 14px; margin-top: 24px; }
-        a.back { display: inline-block; margin-top: 20px; color: #6c63ff; font-size: 16px; }
+        body{font-family:sans-serif;padding:24px;text-align:center;background:#f9f9f9;color:#333}
+        h2{color:#e94560}
+        #qr{max-width:260px;width:100%;border:3px solid #e94560;border-radius:16px;margin:20px auto;display:none}
+        .status{font-size:18px;margin:16px 0}
+        .success{color:#22c55e;font-weight:bold;font-size:22px}
+        .error{color:#e94560}
+        .hint{color:#999;font-size:14px;margin-top:24px}
+        a.back{display:inline-block;margin-top:20px;color:#6c63ff;font-size:16px}
       </style>
       <script>
-        const phone = ${JSON.stringify(phone)};
-        const tokenParam = ${JSON.stringify(tokenParam)};
-        async function poll() {
-          try {
-            const res = await fetch('/status?phone=' + encodeURIComponent(phone) + tokenParam);
-            const data = await res.json();
-            const statusEl = document.getElementById('status');
-            const qrEl = document.getElementById('qr');
-            if (data.qrDataUrl) { qrEl.src = data.qrDataUrl; qrEl.style.display = 'block'; }
-            const messages = {
-              starting: '⏳ Starting browser on Render...',
-              waiting_scan: '📱 Open XHS app → scan the QR code above',
-              success: '✅ Login successful! Cookies saved to Supabase.',
-              timeout: '⏰ Timed out. Please refresh and try again.',
-              error: '❌ Error: ' + (data.error || 'Unknown error'),
-            };
-            statusEl.textContent = messages[data.status] || data.status;
-            if (data.status === 'success') {
-              statusEl.className = 'status success';
-              qrEl.style.display = 'none';
-            } else if (data.status === 'timeout' || data.status === 'error') {
-              statusEl.className = 'status error';
-            } else {
-              setTimeout(poll, data.status === 'starting' ? 1500 : 2000);
-            }
-          } catch (e) { setTimeout(poll, 3000); }
+        var phone = ${JSON.stringify(phone)};
+        var tokenParam = ${JSON.stringify(tokenParam)};
+        function poll() {
+          fetch('/status?phone=' + encodeURIComponent(phone) + tokenParam)
+            .then(function(r){ return r.json(); })
+            .then(function(data) {
+              var statusEl = document.getElementById('status');
+              var qrEl = document.getElementById('qr');
+              if (data.qrDataUrl) { qrEl.src = data.qrDataUrl; qrEl.style.display = 'block'; }
+              var msgs = { starting:'Starting browser...', waiting_scan:'Open XHS app and scan the QR code above', success:'Login successful! Cookies saved.', timeout:'Timed out. Refresh and try again.', error:'Error: '+(data.error||'Unknown') };
+              statusEl.textContent = msgs[data.status] || data.status;
+              if (data.status === 'success') { statusEl.className='status success'; qrEl.style.display='none'; }
+              else if (data.status === 'timeout' || data.status === 'error') { statusEl.className='status error'; }
+              else { setTimeout(poll, data.status==='starting' ? 1500 : 2000); }
+            })
+            .catch(function(){ setTimeout(poll, 3000); });
         }
-        window.onload = () => setTimeout(poll, 800);
+        window.onload = function(){ setTimeout(poll, 800); };
       </script>
     </head>
     <body>
-      <h2>小红书 Login</h2>
+      <h2>XHS Login</h2>
       <p>Logging in: <strong>${phone}</strong></p>
       <img id="qr" alt="QR Code" />
-      <p class="status" id="status">⏳ Starting browser on Render...</p>
+      <p class="status" id="status">Starting browser on Render...</p>
       <p class="hint">Keep this page open. It auto-updates until login completes.</p>
-      <a class="back" href="/accounts${token ? '?token=' + encodeURIComponent(token) : ''}">← Back to accounts</a>
-    </body>
-    </html>`);
+      <a class="back" href="/accounts${token ? '?token=' + encodeURIComponent(token) : ''}">Back to accounts</a>
+    </body></html>`);
 });
 
-// ── GET /status?phone=...&token=SECRET ────────────────────────
-app.get("/status", (req, res) => {
+app.get("/status", function(req, res) {
   if (!checkAuth(req, res)) return;
   const phone = (req.query.phone as string) || "";
   res.json(sessions.get(phone) ?? { qrDataUrl: null, status: "not_started" });
 });
 
-// ── GET /accounts?token=SECRET ────────────────────────────────
-app.get("/accounts", async (req, res) => {
+app.get("/accounts", async function(req, res) {
   if (!checkAuth(req, res)) return;
   const token = (req.query.token as string) || "";
   const tokenQuery = token ? `?token=${encodeURIComponent(token)}` : "";
 
-  const { data, error } = await supabase
-    .from("xhs_accounts")
-    .select("phone, active, banned, shadowbanned, last_post_at, posts_today, cookie_json");
-
+  const { data, error } = await supabase.from("xhs_accounts").select("phone, active, banned, shadowbanned, last_post_at, posts_today, cookie_json");
   if (error) return res.status(500).send(`<h2>Supabase error: ${error.message}</h2>`);
 
-  const rows = (data || []).map((a) => {
-    const sessionStatus = a.cookie_json
-      ? '<span style="color:green">Active</span>'
-      : '<span style="color:orange">Needs login</span>';
-    const loginUrl = `/login?phone=${encodeURIComponent(a.phone)}${token ? "&token=" + encodeURIComponent(token) : ""}`;
-    return `<tr>
-      <td>${a.phone}</td>
-      <td>${a.active ? "Yes" : "No"}</td>
-      <td>${a.banned ? "Banned" : "OK"}</td>
-      <td>${a.shadowbanned ? "Shadowbanned" : "OK"}</td>
-      <td>${a.last_post_at ? new Date(a.last_post_at).toLocaleString() : "Never"}</td>
-      <td>${a.posts_today}</td>
-      <td>${sessionStatus}</td>
-      <td><a href="${loginUrl}">Login / Refresh</a></td>
-    </tr>`;
+  const rows = (data || []).map(function(a: Record<string, unknown>) {
+    const sessionStatus = a.cookie_json ? '<span style="color:green">Active</span>' : '<span style="color:orange">Needs login</span>';
+    const loginUrl = `/login?phone=${encodeURIComponent(String(a.phone))}${token ? "&token=" + encodeURIComponent(token) : ""}`;
+    return `<tr><td>${a.phone}</td><td>${a.active ? "Yes" : "No"}</td><td>${a.banned ? "Banned" : "OK"}</td><td>${a.shadowbanned ? "Shadowbanned" : "OK"}</td><td>${a.last_post_at ? new Date(String(a.last_post_at)).toLocaleString() : "Never"}</td><td>${a.posts_today}</td><td>${sessionStatus}</td><td><a href="${loginUrl}">Login</a></td></tr>`;
   }).join("");
 
-  res.send(`
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body { font-family: sans-serif; padding: 20px; background: #f9f9f9; }
-        h2 { color: #e94560; }
-        table { width: 100%; border-collapse: collapse; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-        th { background: #1a1a2e; color: white; padding: 12px 8px; text-align: left; font-size: 13px; }
-        td { padding: 12px 8px; border-bottom: 1px solid #eee; font-size: 14px; }
-        a { color: #6c63ff; }
-        .add-btn { display: inline-block; margin-top: 16px; padding: 12px 24px; background: #e94560; color: white; text-decoration: none; border-radius: 8px; font-size: 16px; }
-      </style>
-    </head>
-    <body>
+  res.send(`<html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>body{font-family:sans-serif;padding:20px;background:#f9f9f9}h2{color:#e94560}table{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)}th{background:#1a1a2e;color:white;padding:12px 8px;text-align:left;font-size:13px}td{padding:12px 8px;border-bottom:1px solid #eee;font-size:14px}a{color:#6c63ff}.add-btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#e94560;color:white;text-decoration:none;border-radius:8px;font-size:16px}</style>
+    </head><body>
       <h2>XHS Accounts</h2>
-      <table>
-        <tr><th>Phone</th><th>Active</th><th>Banned</th><th>Shadowbanned</th><th>Last Post</th><th>Posts Today</th><th>Session</th><th>Action</th></tr>
-        ${rows || '<tr><td colspan="8" style="text-align:center;color:#999">No accounts yet</td></tr>'}
+      <table><tr><th>Phone</th><th>Active</th><th>Banned</th><th>Shadowbanned</th><th>Last Post</th><th>Posts Today</th><th>Session</th><th>Action</th></tr>
+      ${rows || '<tr><td colspan="8" style="text-align:center;color:#999">No accounts yet</td></tr>'}
       </table>
       <a class="add-btn" href="/login${tokenQuery}">+ Add / Re-login Account</a>
-    </body>
-    </html>
-  `);
+    </body></html>`);
 });
 
-app.get("/", (_req, res) => {
-  res.send(`<html><body style="font-family:sans-serif;padding:32px;text-align:center">
-    <h2>XHS Login Helper is running</h2>
-    <p><a href="/accounts">View Accounts</a></p>
-  </body></html>`);
+app.get("/", function(_req, res) {
+  res.send(`<html><body style="font-family:sans-serif;padding:32px;text-align:center"><h2>XHS Login Helper is running</h2><p><a href="/accounts">View Accounts</a></p></body></html>`);
 });
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
-app.listen(PORT, "0.0.0.0", () => console.log(`XHS login helper running on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", function() { console.log("XHS login helper running on port " + PORT); });
