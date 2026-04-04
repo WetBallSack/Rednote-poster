@@ -33,17 +33,13 @@ interface SessionState {
 const sessions = new Map<string, SessionState>();
 
 function isLoggedInFromCookies(cookies: { name: string; value: string }[]): boolean {
-  // XHS sets these cookies only after a successful login confirmation
   const authCookieNames = ["web_session", "xsecappid", "a1"];
   return authCookieNames.some(name =>
     cookies.some(c => c.name === name && c.value.length > 10)
   );
 }
 
-async function saveCookiesAndSucceed(
-  phone: string,
-  cookies: object[],
-): Promise<void> {
+async function saveCookies(phone: string, cookies: object[]): Promise<void> {
   const { error } = await supabase
     .from("xhs_accounts")
     .upsert({ phone, cookie_json: JSON.stringify(cookies), active: true }, { onConflict: "phone" });
@@ -66,11 +62,7 @@ app.get("/login", async (req, res) => {
   if (!phone) {
     return res.send(`
       <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body{font-family:sans-serif;padding:32px;background:#f5f5f5}
-        input,button{font-size:18px;padding:10px;margin:8px 0;width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #ccc}
-        button{background:#e94560;color:white;border:none;cursor:pointer}
-      </style>
+      <style>body{font-family:sans-serif;padding:32px;background:#f5f5f5}input,button{font-size:18px;padding:10px;margin:8px 0;width:100%;box-sizing:border-box;border-radius:8px;border:1px solid #ccc}button{background:#e94560;color:white;border:none;cursor:pointer}</style>
       </head><body>
         <h2>XHS Login Helper</h2>
         <form action="/login" method="get">
@@ -82,7 +74,6 @@ app.get("/login", async (req, res) => {
       </body></html>`);
   }
 
-  // Prevent double-starting
   const existing = sessions.get(phone);
   if (existing?.status === "starting" || existing?.status === "waiting_scan") {
     return res.redirect(`/wait?phone=${encodeURIComponent(phone)}${tokenParam}`);
@@ -105,7 +96,7 @@ app.get("/login", async (req, res) => {
           "--disable-dev-shm-usage",
           "--disable-blink-features=AutomationControlled",
           "--lang=zh-CN",
-          "--disable-web-security",
+          "--font-render-hinting=none",
         ],
       });
 
@@ -123,26 +114,17 @@ app.get("/login", async (req, res) => {
         window.chrome = { runtime: {} };
       `);
 
+      // Use domcontentloaded instead of networkidle — much faster on Render free tier
       console.log("Navigating to XHS...");
-      await page.goto("https://www.xiaohongshu.com", { waitUntil: "networkidle", timeout: 30000 });
-      console.log("Page title:", await page.title());
+      await page.goto("https://www.xiaohongshu.com", { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.waitForTimeout(4000); // let JS settle without waiting for all network
 
-      // Click login button if visible
       const loginBtn = await page.$("text=登录");
       if (loginBtn) {
         await loginBtn.click();
         console.log("Clicked login button");
-      } else {
-        console.log("No login button found — may already be on login page");
       }
       await page.waitForTimeout(3000);
-
-      // Take a full screenshot to help debug what XHS is showing
-      const initScreenshot = await page.screenshot({ fullPage: false });
-      sessions.set(phone, {
-        qrDataUrl: `data:image/png;base64,${initScreenshot.toString("base64")}`,
-        status: "waiting_scan",
-      });
 
       const qrSelectors = [
         '[class*="qrcode"] canvas',
@@ -154,24 +136,30 @@ app.get("/login", async (req, res) => {
         'canvas',
       ];
 
-      const getQRBuffer = async (): Promise<Buffer> => {
-        for (const sel of qrSelectors) {
-          const el = await page.$(sel);
-          if (el) {
-            console.log("Found QR element with selector:", sel);
-            return await el.screenshot() as Buffer;
+      // Wrapped in try/catch — screenshot timeouts must not crash the session
+      const getQRBuffer = async (): Promise<Buffer | null> => {
+        try {
+          for (const sel of qrSelectors) {
+            const el = await page.$(sel);
+            if (el) {
+              console.log("QR element found:", sel);
+              return await el.screenshot({ timeout: 8000 }) as Buffer;
+            }
           }
+          return await page.screenshot({ fullPage: false, timeout: 8000 }) as Buffer;
+        } catch (e) {
+          console.log("Screenshot failed (non-fatal):", (e as Error).message);
+          return null;
         }
-        return await page.screenshot({ fullPage: false }) as Buffer;
       };
 
       const qrBuffer = await getQRBuffer();
       sessions.set(phone, {
-        qrDataUrl: `data:image/png;base64,${qrBuffer.toString("base64")}`,
+        qrDataUrl: qrBuffer ? `data:image/png;base64,${qrBuffer.toString("base64")}` : null,
         status: "waiting_scan",
       });
 
-      // Poll for login — 3 strategies, 3 minute window
+      // Poll up to 3 minutes using 3 detection strategies
       const deadline = Date.now() + 180_000;
       let detected = false;
 
@@ -179,62 +167,60 @@ app.get("/login", async (req, res) => {
         await page.waitForTimeout(2000);
 
         const cookies = await context.cookies();
-        const cookieNames = cookies.map(c => c.name).join(", ");
-        console.log(`[${new Date().toISOString()}] Cookies (${cookies.length}): ${cookieNames}`);
+        console.log(`[${new Date().toISOString()}] Cookies (${cookies.length}): ${cookies.map(c => c.name).join(", ")}`);
 
-        // Refresh the QR display
-        const qrBuffer = await getQRBuffer();
+        // Refresh QR (non-fatal)
+        const refreshBuffer = await getQRBuffer();
         const currentState = sessions.get(phone);
-        if (qrBuffer && currentState?.status === "waiting_scan") {
+        if (refreshBuffer && currentState?.status === "waiting_scan") {
           sessions.set(phone, {
             ...currentState,
-            qrDataUrl: `data:image/png;base64,${qrBuffer.toString("base64")}`,
+            qrDataUrl: `data:image/png;base64,${refreshBuffer.toString("base64")}`,
           });
         }
 
-        // Strategy 1: auth cookies (fires right after "confirm login" in XHS app)
+        // Strategy 1: auth cookie detection
         if (isLoggedInFromCookies(cookies)) {
-          console.log("✓ Login detected via auth cookies");
+          console.log("Login detected via auth cookies");
           detected = true;
-          await saveCookiesAndSucceed(phone, cookies);
+          await saveCookies(phone, cookies);
           break;
         }
 
-        // Strategy 2: page URL changed away from login
+        // Strategy 2: URL change
         const currentUrl = page.url();
         console.log("URL:", currentUrl);
         if (
           currentUrl.includes("xiaohongshu.com") &&
           !currentUrl.includes("/login") &&
           !currentUrl.includes("/signin") &&
-          !currentUrl.includes("about:blank")
+          currentUrl !== "about:blank"
         ) {
-          console.log("✓ Login detected via URL change:", currentUrl);
+          console.log("Login detected via URL change:", currentUrl);
           detected = true;
-          await saveCookiesAndSucceed(phone, cookies);
+          await saveCookies(phone, cookies);
           break;
         }
 
-        // Strategy 3: user avatar in DOM
+        // Strategy 3: DOM element
         const loggedIn = await page.$(
-          '[data-testid="user-avatar"], .user-avatar, [class*="userAvatar"], ' +
-          '.reds-avatar, [class*="user-info"], [class*="userInfo"], [class*="HeaderAvatar"]'
+          '[data-testid="user-avatar"], .user-avatar, [class*="userAvatar"], .reds-avatar, [class*="HeaderAvatar"]'
         );
         if (loggedIn) {
-          console.log("✓ Login detected via DOM element");
+          console.log("Login detected via DOM");
           detected = true;
-          await saveCookiesAndSucceed(phone, cookies);
+          await saveCookies(phone, cookies);
           break;
         }
       }
 
-      // Last resort: save whatever we have if > 3 cookies collected
+      // Last resort: save whatever cookies exist
       if (!detected) {
         const cookies = await context.cookies();
         console.log(`Timeout. Final cookie count: ${cookies.length}`);
         if (cookies.length > 3) {
-          console.log("Saving cookies on timeout as last resort");
-          await saveCookiesAndSucceed(phone, cookies);
+          console.log("Saving cookies as last resort");
+          await saveCookies(phone, cookies);
         } else {
           sessions.set(phone, { qrDataUrl: null, status: "timeout" });
         }
@@ -249,7 +235,6 @@ app.get("/login", async (req, res) => {
     }
   })();
 
-  // Redirect to the waiting/polling page
   res.redirect(`/wait?phone=${encodeURIComponent(phone)}${tokenParam}`);
 });
 
@@ -316,7 +301,7 @@ app.get("/wait", function(req, res) {
       <p class="status" id="status">Starting...</p>
       <p id="cookie-count" class="cookie-count"></p>
       <p class="hint">
-        1. Wait for the QR code to appear (up to 30s)<br>
+        1. Wait for the QR code to appear (up to 60s on cold start)<br>
         2. Open XHS app → tap the scan icon<br>
         3. Scan the QR code<br>
         4. Tap <strong>确认登录 (Confirm Login)</strong> in the app<br>
@@ -373,7 +358,7 @@ app.get("/accounts", async function(req, res) {
       <h2>XHS Accounts</h2>
       <table>
         <tr><th>Phone</th><th>Active</th><th>Banned</th><th>Shadowbanned</th><th>Last Post</th><th>Posts Today</th><th>Session</th><th>Action</th></tr>
-        ${rows || '<tr><td colspan="8" style="text-align:center;color:#999;padding:20px">No accounts yet — add one below</td></tr>'}
+        ${rows || '<tr><td colspan="8" style="text-align:center;color:#999;padding:20px">No accounts yet</td></tr>'}
       </table>
       <a class="add-btn" href="/login${tokenQuery}">+ Add / Re-login Account</a>
     </body></html>`);
